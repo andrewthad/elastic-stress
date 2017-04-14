@@ -15,6 +15,9 @@ import Control.Monad
 import Network.HTTP.Types.Status (statusCode)
 import Data.Aeson ((.=))
 import System.Exit (exitFailure)
+import Data.Text (Text)
+import qualified Data.Sequence as SQ
+import qualified System.Clock as CLK
 import qualified Data.ByteString.Lazy as LB
 import qualified Data.Aeson as AE
 import qualified Control.Monad.STM as STM
@@ -80,13 +83,23 @@ program putLog = do
       firstHost = head (settingsHosts s)
   mngr <- HC.newManager HC.defaultManagerSettings
   mapping <- loadMapping putLog (settingsMapping s)
-  initIndexReq <- HC.parseUrlThrow ("http://" ++ firstHost ++ "/stress-test")
+  initDelIndexReq <- HC.parseRequest ("http://" ++ firstHost ++ ":9200/stress-test")
+  _ <- HC.httpLbs (initDelIndexReq { HC.method = "DELETE" }) mngr
+  initIndexReq <- HC.parseUrlThrow ("http://" ++ firstHost ++ ":9200/stress-test")
   let index = AE.object
         [ "settings" .= AE.object
           [ "number_of_shards" .= length (settingsHosts s)
           , "number_of_replicas" .= (0 :: Int)
+          , "index" .= AE.object
+            [ "mapping" .= AE.object
+              [ "total_fields" .= AE.object
+                [ "limit" .= (3000 :: Int)
+                ]
+              ]
+            ]
           ]
         , "mappings" .= mapping
+        , "refresh_interval" .= ("15s" :: Text)
         ]
       indexReq = initIndexReq
         { HC.method = "PUT"
@@ -96,7 +109,7 @@ program putLog = do
   chan <- newTBMChanIO totalConnections
   threads <- TG.new
   forM_ (settingsHosts s) $ \host -> do
-    initReq <- HC.parseRequest ("http://" ++ host ++ "/_bulk")
+    initReq <- HC.parseRequest ("http://" ++ host ++ ":9200/_bulk")
     forM_ (enumFromTo 1 (settingsConnections s)) $ \connNum -> do
       let logPrefix = BC.pack (rpad 16 host ++ " [" ++ show connNum ++ "]: ")
           putPrefixedLog logStr = putLog (FL.toLogStr logPrefix <> logStr)
@@ -117,9 +130,15 @@ program putLog = do
         putPrefixedLog "Terminating thread.\n"
   withFile (settingsDocuments s) ReadMode $ \h -> do
     SB.fromHandle h
-      & lineSplit 10000
+      & lineSplit (settingsBatchSize s * 2)
       & SM.mapped SB.toLazy
-      & SMP.mapM_ (STM.atomically . writeTBMChan chan) 
+      & SMP.mapM (\x -> STM.atomically (writeTBMChan chan x) >> fmap CLK.toNanoSecs (CLK.getTime CLK.Monotonic))
+      & SMP.slidingWindow 40
+      & SMP.mapM_ (\timeSeq -> maybe 
+          (return ())
+          (\i -> putLog ("Documents per second: " <> FL.toLogStr (show i) <> "\n"))
+          (diffSequence (settingsBatchSize s) timeSeq)
+        )
     putLog "Finished reading from stdin. Waiting for remaining writes to ElasticSearch.\n"
   TG.wait threads
   putLog "All threads have terminated. Exiting.\n"
@@ -132,6 +151,17 @@ loadMapping putLog filename = do
       putLog "Mapping file was not valid JSON. Exiting."
       exitFailure 
     Just v -> return v
+
+diffSequence :: 
+     Int -- ^ Number of elements in each batch
+  -> SQ.Seq Integer -- ^ series of timestamps in nanoseconds
+  -> Maybe Integer -- ^ Elements per second
+diffSequence batchSize timeSeq = case SQ.viewl timeSeq of
+  SQ.EmptyL -> Nothing
+  earliest SQ.:< timeSeq' -> case SQ.viewr timeSeq' of
+    SQ.EmptyR -> Nothing
+    _ SQ.:> latest -> Just (div (1000000000 * fromIntegral (SQ.length timeSeq) * fromIntegral batchSize) (latest - earliest))
+    
 
 rpad :: Int -> String -> String
 rpad m xs = take m $ xs ++ repeat ' '
